@@ -21,6 +21,7 @@ from PIL import Image
 from torch import Tensor
 from torch.func import jacrev
 
+from stamp.modeling.calibration import get_calibrated_probabilities
 from stamp.modeling.data import get_coords, get_stride
 from stamp.modeling.deploy import load_model_from_ckpt
 from stamp.preprocessing import supported_extensions
@@ -330,7 +331,7 @@ def heatmaps_(
 
         # TODO: Update version when a newer model logic breaks heatmaps.
         stamp_version = str(getattr(model, "stamp_version", ""))
-        if Version(stamp_version) < Version("2.5.0"):
+        if Version(stamp_version) < Version("2.4.0"): # FIX for masters thesis..
             raise ValueError(
                 f"model has been built with stamp version {stamp_version} "
                 f"which is incompatible with the current version."
@@ -348,7 +349,19 @@ def heatmaps_(
 
         match model.hparams["task"]:
             case "classification":
-                slide_score = slide_score.softmax(0)
+                # Apply temperature scaling if model was calibrated,
+                # otherwise use standard softmax
+                temperature = getattr(model.hparams, "temperature", None)
+                if temperature is not None:
+                    _logger.info(
+                        f"Using calibrated model (temperature={temperature:.4f}) "
+                        "for heatmap generation"
+                    )
+                    slide_score = get_calibrated_probabilities(
+                        slide_score.unsqueeze(0), temperature
+                    ).squeeze(0)
+                else:
+                    slide_score = slide_score.softmax(0)
                 # Find the class with highest probability
                 highest_prob_class_idx = slide_score.argmax().item()
 
@@ -363,16 +376,20 @@ def heatmaps_(
                 ).detach()  # shape: [width, height, category]
 
                 with torch.no_grad():
-                    scores = torch.softmax(
-                        model.model(
-                            feats.unsqueeze(-2),
-                            coords=coords_um.unsqueeze(-2),
-                            mask=torch.zeros(
-                                len(feats), 1, dtype=torch.bool, device=device
-                            ),
+                    tile_logits = model.model(
+                        feats.unsqueeze(-2),
+                        coords=coords_um.unsqueeze(-2),
+                        mask=torch.zeros(
+                            len(feats), 1, dtype=torch.bool, device=device
                         ),
-                        dim=1,
                     )  # shape: [tile, category]
+                    # Apply temperature scaling for calibrated models
+                    if temperature is not None:
+                        scores = get_calibrated_probabilities(
+                            tile_logits, temperature
+                        )
+                    else:
+                        scores = torch.softmax(tile_logits, dim=1)
                 scores_2d = _vals_to_im(
                     scores, coords_norm
                 ).detach()  # shape: [width, height, category]
