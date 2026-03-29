@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from lightning.pytorch.accelerators.accelerator import Accelerator
 
+from stamp.modeling.calibration import get_calibrated_probabilities
 from stamp.modeling.data import (
     create_dataloader,
     detect_feature_type,
@@ -419,8 +420,15 @@ def _predict(
         }
 
         if getattr(model.hparams, "task", None) == "classification":
+            # Apply temperature scaling if model was calibrated
+            temperature = getattr(model.hparams, "temperature", None)
             for k in list(per_target_tensors.keys()):
-                per_target_tensors[k] = torch.softmax(per_target_tensors[k], dim=1)
+                if temperature is not None:
+                    per_target_tensors[k] = get_calibrated_probabilities(
+                        per_target_tensors[k], temperature
+                    )
+                else:
+                    per_target_tensors[k] = torch.softmax(per_target_tensors[k], dim=1)
 
         # build per-patient dicts
         num_preds = next(iter(per_target_tensors.values())).shape[0]
@@ -438,7 +446,12 @@ def _predict(
     raw_preds = torch.cat(outs_single, dim=0)
 
     if getattr(model.hparams, "task", None) == "classification":
-        raw_preds = torch.softmax(raw_preds, dim=1)
+        # Apply temperature scaling if model was calibrated
+        temperature = getattr(model.hparams, "temperature", None)
+        if temperature is not None:
+            raw_preds = get_calibrated_probabilities(raw_preds, temperature)
+        else:
+            raw_preds = torch.softmax(raw_preds, dim=1)
     elif getattr(model.hparams, "task", None) == "survival":
         raw_preds = raw_preds.squeeze(-1)
 

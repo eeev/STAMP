@@ -6,6 +6,7 @@ to the task-specific statistic implementations found in the submodules.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NewType
@@ -15,6 +16,10 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from pydantic import BaseModel, ConfigDict, Field
 
+from stamp.statistics.calibration import (
+    compute_calibration_metrics,
+    plot_reliability_diagram,
+)
 from stamp.statistics.categorical import (
     categorical_aggregated_,
     categorical_aggregated_multitarget_,
@@ -37,6 +42,8 @@ __all__ = ["StatsConfig", "compute_stats_"]
 __author__ = "Marko van Treeck, Minh Duc Nguyen"
 __copyright__ = "Copyright (C) 2022-2024 Marko van Treeck, Minh Duc Nguyen"
 __license__ = "MIT"
+
+_logger = logging.getLogger("stamp")
 
 
 def _read_table(file: Path, **kwargs) -> pd.DataFrame:
@@ -61,6 +68,80 @@ class StatsConfig(BaseModel):
 
 
 _Inches = NewType("_Inches", float)
+
+
+def _compute_and_save_calibration(
+    *,
+    output_dir: Path,
+    preds_dfs: Sequence[pd.DataFrame],
+    ground_truth_label: str,
+    true_class: str,
+    n_bins: int = 10,
+) -> None:
+    """Compute calibration metrics and plot reliability diagram.
+
+    Args:
+        output_dir: Directory to save calibration outputs.
+        preds_dfs: List of prediction DataFrames.
+        ground_truth_label: Column name for ground truth labels.
+        true_class: The positive class for binary calibration.
+        n_bins: Number of bins for ECE computation.
+    """
+    # Collect all probabilities and labels
+    all_probs = []
+    all_labels = []
+
+    for df in preds_dfs:
+        prob_col = f"{ground_truth_label}_{true_class}"
+        if prob_col not in df.columns:
+            continue
+
+        probs = df[prob_col].values.astype(float)
+        labels = (df[ground_truth_label] == true_class).astype(int).values
+
+        all_probs.append(probs)
+        all_labels.append(labels)
+
+    if not all_probs:
+        return
+
+    # Concatenate all predictions
+    probs = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
+
+    # Plot reliability diagram
+    ece = plot_reliability_diagram(
+        probs=probs,
+        labels=labels,
+        n_bins=n_bins,
+        output_path=output_dir / f"reliability-diagram_{ground_truth_label}={true_class}.svg",
+        title="Reliability Diagram",
+        class_name=f"{ground_truth_label}={true_class}",
+    )
+
+    # Compute additional calibration metrics
+    cal_metrics = compute_calibration_metrics(
+        probs=probs,
+        labels=labels,
+        n_bins=n_bins,
+    )
+
+    # Save calibration metrics to CSV
+    cal_df = pd.DataFrame([{
+        "ground_truth_label": ground_truth_label,
+        "true_class": true_class,
+        "ece": cal_metrics["ece"],
+        "mce": cal_metrics["mce"],
+        "brier_score": cal_metrics["brier_score"],
+        "n_samples": len(labels),
+    }])
+    cal_df.to_csv(output_dir / f"calibration_{ground_truth_label}={true_class}.csv", index=False)
+
+    _logger.info(
+        f"Calibration metrics for {ground_truth_label}={true_class}: "
+        f"ECE={cal_metrics['ece']:.4f}, MCE={cal_metrics['mce']:.4f}, "
+        f"Brier={cal_metrics['brier_score']:.4f}"
+    )
 
 
 def _compute_multitarget_classification_stats(
@@ -316,6 +397,14 @@ def compute_stats_(
                     output_dir / f"pr-curve_{ground_truth_label}={true_class}.svg"
                 )
                 plt.close(fig)
+
+                # Compute calibration metrics and plot reliability diagram
+                _compute_and_save_calibration(
+                    output_dir=output_dir,
+                    preds_dfs=preds_dfs,
+                    ground_truth_label=ground_truth_label,
+                    true_class=true_class,
+                )
 
                 categorical_aggregated_(
                     preds_csvs=pred_csvs,

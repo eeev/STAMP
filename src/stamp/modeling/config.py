@@ -9,6 +9,27 @@ from stamp.modeling.registry import ModelName
 from stamp.types import Category, PandasLabel, Task
 
 
+class CalibrationConfig(BaseModel):
+    """Configuration for temperature scaling calibration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to apply temperature scaling calibration after training.",
+    )
+    max_iterations: int = Field(
+        default=50,
+        ge=10,
+        description="Maximum iterations for temperature optimization.",
+    )
+    learning_rate: float = Field(
+        default=0.01,
+        gt=0,
+        description="Learning rate for temperature optimization.",
+    )
+
+
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task: Task | None = Field(default="classification")
@@ -43,6 +64,18 @@ class TrainConfig(BaseModel):
     params_path: Path | None = Field(
         default=None,
         description="Optional: Path to a YAML file with advanced training parameters.",
+    )
+
+    # Calibration settings
+    calibration: CalibrationConfig = Field(
+        default_factory=CalibrationConfig,
+        description="Temperature scaling calibration settings.",
+    )
+
+    # MILAN weights
+    milan_table: Path | None = Field(
+        default=None,
+        description="Optional CSV mapping PATIENT to Milan category for sample-level loss weighting.",
     )
 
     # Experimental features

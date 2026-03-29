@@ -89,7 +89,7 @@ class Base(lightning.LightningModule, ABC):
         # This should only happen when the model is loaded,
         # otherwise the default value will make these checks pass.
         # TODO: Change this on version change
-        if stamp_version < Version("2.5.0"):
+        if stamp_version < Version("2.4.0"):
             # Update this as we change our model in incompatible ways!
             raise ValueError(
                 f"model has been built with stamp version {stamp_version} "
@@ -233,17 +233,20 @@ class LitTileClassifier(_TileLevelMixin, LitBaseClassifier):
     def forward(
         self,
         bags: Bags,
+        *,
+        coords: CoordinatesBatch | None = None,
+        mask: Bool[Tensor, "batch tile"] | None = None,
     ) -> Float[Tensor, "batch logit"]:
-        return self.model(bags)
+        return self.model(bags, coords=coords, mask=mask)
 
     def _step(
         self,
         *,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, Tensor] | list[Tensor],
         step_name: str,
         use_mask: bool,
     ) -> Loss:
-        bags, coords, bag_sizes, targets = batch
+        bags, coords, bag_sizes, targets, sample_weights = batch
 
         mask = (
             self._mask_from_bags(bags=bags, bag_sizes=bag_sizes) if use_mask else None
@@ -251,11 +254,22 @@ class LitTileClassifier(_TileLevelMixin, LitBaseClassifier):
 
         logits = self.model(bags, coords=coords, mask=mask)
 
-        loss = nn.functional.cross_entropy(
-            logits,
-            targets.type_as(logits),
-            weight=self.class_weights.type_as(logits),
-        )
+        # During training: apply sample weights to loss
+        # During validation/test: compute loss weight-agnostically (no sample weights)
+        if step_name == "training":
+            loss_per_sample = nn.functional.cross_entropy(
+                logits,
+                targets.type_as(logits),
+                weight=self.class_weights.type_as(logits),
+                reduction='none',
+            )
+            loss = (loss_per_sample * sample_weights.type_as(logits)).mean()
+        else:
+            loss = nn.functional.cross_entropy(
+                logits,
+                targets.type_as(logits),
+                weight=self.class_weights.type_as(logits),
+            )
 
         self.log(
             f"{step_name}_loss",
@@ -280,31 +294,31 @@ class LitTileClassifier(_TileLevelMixin, LitBaseClassifier):
 
     def training_step(
         self,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, Tensor] | list[Tensor],
         batch_idx: int,
     ) -> Loss:
         return self._step(batch=batch, step_name="training", use_mask=False)
 
     def validation_step(
         self,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, Tensor] | list[Tensor],
         batch_idx: int,
     ) -> Loss:
         return self._step(batch=batch, step_name="validation", use_mask=False)
 
     def test_step(
         self,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, Tensor] | list[Tensor],
         batch_idx: int,
     ) -> Loss:
         return self._step(batch=batch, step_name="test", use_mask=False)
 
     def predict_step(
         self,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, Tensor] | list[Tensor],
         batch_idx: int,
     ) -> Float[Tensor, "batch logit"]:
-        bags, coords, bag_sizes, _ = batch
+        bags, coords, bag_sizes, _, _ = batch
         # adding a mask here will *drastically* and *unbearably* increase memory usage
         # Ensure input dtype matches model weights to avoid dtype-mismatch errors
         param_dtype = next(self.model.parameters()).dtype
@@ -322,15 +336,28 @@ class LitSlideClassifier(LitBaseClassifier):
         return self.model(x)
 
     def _step(
-        self, batch: tuple[Tensor, Tensor] | list[Tensor], step_name: str
+        self, batch: tuple[Tensor, Tensor, Tensor] | list[Tensor], step_name: str
     ) -> Loss:
-        feats, targets = list(batch)  # Works for both tuple and list
+        feats, targets, sample_weights = list(batch)  # Works for both tuple and list
         logits = self.model(feats.float())
-        loss = nn.functional.cross_entropy(
-            logits,
-            targets.type_as(logits),
-            weight=self.class_weights.type_as(logits),
-        )
+        
+        # During training: apply sample weights to loss
+        # During validation/test: compute loss weight-agnostically (no sample weights)
+        if step_name == "training":
+            loss_per_sample = nn.functional.cross_entropy(
+                logits,
+                targets.type_as(logits),
+                weight=self.class_weights.type_as(logits),
+                reduction='none',
+            )
+            loss = (loss_per_sample * sample_weights.type_as(logits)).mean()
+        else:
+            loss = nn.functional.cross_entropy(
+                logits,
+                targets.type_as(logits),
+                weight=self.class_weights.type_as(logits),
+            )
+        
         self.log(
             f"{step_name}_loss",
             loss,
@@ -351,24 +378,24 @@ class LitSlideClassifier(LitBaseClassifier):
         return loss
 
     def training_step(
-        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor, Tensor] | list[Tensor], batch_idx: int
     ) -> Loss:
         return self._step(batch, "training")
 
     def validation_step(
-        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor, Tensor] | list[Tensor], batch_idx: int
     ) -> Loss:
         return self._step(batch, "validation")
 
     def test_step(
-        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor, Tensor] | list[Tensor], batch_idx: int
     ) -> Loss:
         return self._step(batch, "test")
 
     def predict_step(
-        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor, Tensor] | list[Tensor], batch_idx: int
     ) -> Tensor:
-        feats, _ = batch if isinstance(batch, tuple) else batch
+        feats, _, _ = batch if isinstance(batch, tuple) else batch
         # Cast inputs to model parameter dtype to avoid Half/Float mismatches
         param_dtype = next(self.model.parameters()).dtype
         feats = feats.to(dtype=param_dtype)

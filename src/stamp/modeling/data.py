@@ -19,6 +19,7 @@ from typing import (
     Union,
     cast,
 )
+from jaxtyping import Float
 
 import h5py
 import numpy as np
@@ -80,6 +81,7 @@ class PatientData(Generic[GroundTruthType]):
     _ = KW_ONLY
     ground_truth: GroundTruthType
     feature_files: Iterable[FeaturePath | _BinaryIOLike]
+    sample_weight: float = 1.0
 
 
 def tile_bag_dataloader(
@@ -106,6 +108,9 @@ def tile_bag_dataloader(
         task='regression':
             returns float targets
     """
+    sw = torch.tensor(
+        [p.sample_weight for p in patient_data], dtype=torch.float32
+    )
 
     targets, cats_out = _parse_targets(
         patient_data=patient_data,
@@ -123,6 +128,7 @@ def tile_bag_dataloader(
         ground_truths=targets,
         transform=transform,
         deterministic=(not shuffle),
+        sample_weights=sw,
     )
     dl = DataLoader(
         ds,
@@ -253,14 +259,18 @@ def _parse_targets(
         raise ValueError(f"Unsupported task: {task}")
 
 
-def _collate_to_tuple(
-    items: list[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]],
-) -> tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets]:
-    bags = torch.stack([bag for bag, _, _, _ in items])
-    coords = torch.stack([coord for _, coord, _, _ in items])
-    bag_sizes = torch.tensor([bagsize for _, _, bagsize, _ in items])
+_SampleWeight: TypeAlias = float
 
-    targets = [et for _, _, _, et in items]
+
+def _collate_to_tuple(
+    items: list[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget, _SampleWeight]],
+) -> tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets, torch.Tensor]:
+    bags = torch.stack([bag for bag, _, _, _, _ in items])
+    coords = torch.stack([coord for _, coord, _, _, _ in items])
+    bag_sizes = torch.tensor([bagsize for _, _, bagsize, _, _ in items])
+
+    targets = [et for _, _, _, et, _ in items]
+    weights = torch.tensor([w for _, _, _, _, w in items], dtype=torch.float32)
 
     # Normalize target shapes
     fixed_targets = []
@@ -275,7 +285,7 @@ def _collate_to_tuple(
     # Stack into (B, D)
     encoded_targets = torch.stack(fixed_targets)
 
-    return (bags, coords, bag_sizes, encoded_targets)
+    return (bags, coords, bag_sizes, encoded_targets, weights)
 
 
 def _collate_multitarget(
@@ -356,6 +366,7 @@ def create_dataloader(
     elif feature_type in {"slide", "patient"}:
         # For slide/patient-level: single feature vector per entry
         feature_files = [next(iter(p.feature_files)) for p in patient_data]
+        sw = torch.tensor([p.sample_weight for p in patient_data], dtype=torch.float32)
 
         if task == "classification":
             raw = np.array([p.ground_truth for p in patient_data])
@@ -408,7 +419,7 @@ def create_dataloader(
         else:
             raise ValueError(f"Unsupported task: {task}")
 
-        ds = PatientFeatureDataset(feature_files, labels, transform)
+        ds = PatientFeatureDataset(feature_files, labels, transform, sample_weights=sw)
         dl = DataLoader(
             ds,
             batch_size=batch_size,
@@ -435,7 +446,7 @@ def detect_feature_type(feature_dir: Path) -> str:
     feature_types = set()
     files_checked = 0
 
-    for file in feature_dir.rglob("*.h5"):
+    for file in feature_dir.glob("*.h5"):
         files_checked += 1
         with h5py.File(file, "r") as h5:
             feat_type = h5.attrs.get("feat_type")
@@ -560,6 +571,7 @@ class BagDataset(Dataset[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]]):
 
     transform: Callable[[Tensor], Tensor] | None
     deterministic: bool = False
+    sample_weights: Float[Tensor, "index"] | None = None
 
     def __post_init__(self) -> None:
         if len(self.bags) != len(self.ground_truths):
@@ -585,7 +597,7 @@ class BagDataset(Dataset[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]]):
 
     def __getitem__(
         self, index: int
-    ) -> tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]:
+    ) -> tuple[_Bag, _Coordinates, BagSize, _EncodedTarget, float]:
         # Collect all the features
         feats = []
         coords_um = []
@@ -637,6 +649,8 @@ class BagDataset(Dataset[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]]):
         if self.transform is not None:
             feats = self.transform(feats)
 
+        weight = self.sample_weights[index].item() if self.sample_weights is not None else 1.0
+
         # Sample a subset, if required
         if self.bag_size is not None:
             return (
@@ -647,6 +661,7 @@ class BagDataset(Dataset[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]]):
                     deterministic=self.deterministic,
                 ),
                 self.ground_truths[index],
+                weight,
             )
         else:
             return (
@@ -654,13 +669,14 @@ class BagDataset(Dataset[tuple[_Bag, _Coordinates, BagSize, _EncodedTarget]]):
                 coords_um,
                 len(feats),
                 self.ground_truths[index],
+                weight,
             )
 
 
 class PatientFeatureDataset(Dataset):
     """
     Dataset for single feature vector per sample (e.g. slide-level or patient-level).
-    Each item is a (feature_vector, label_onehot) tuple.
+    Each item is a (feature_vector, label_onehot, sample_weight) tuple.
     """
 
     def __init__(
@@ -668,12 +684,14 @@ class PatientFeatureDataset(Dataset):
         feature_files: Sequence[FeaturePath | _BinaryIOLike],
         ground_truths: Tensor,  # shape: [num_samples, num_classes]
         transform: Callable[[Tensor], Tensor] | None,
+        sample_weights: Tensor | None = None,
     ):
         if len(feature_files) != len(ground_truths):
             raise ValueError("Number of feature files and ground truths must match.")
         self.feature_files = feature_files
         self.ground_truths = ground_truths
         self.transform = transform
+        self.sample_weights = sample_weights if sample_weights is not None else torch.ones(len(feature_files))
         # Initialise per-worker HDF5 handle cache eagerly so __getitem__ avoids
         # a hasattr() call on every sample read.
         self._h5_handle_cache: dict[FeaturePath | _BinaryIOLike, h5py.File] = {}
@@ -722,7 +740,8 @@ class PatientFeatureDataset(Dataset):
         if self.transform is not None:
             feats = self.transform(feats)
         label = self.ground_truths[idx]
-        return feats, label
+        weight = self.sample_weights[idx]
+        return feats, label, weight
 
 
 @dataclass

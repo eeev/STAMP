@@ -22,7 +22,7 @@ from stamp.modeling.deploy import (
     _to_survival_prediction_df,
     load_model_from_ckpt,
 )
-from stamp.modeling.train import setup_model_from_dataloaders, train_model_
+from stamp.modeling.train import _load_milan_weights, setup_model_from_dataloaders, train_model_
 from stamp.modeling.transforms import VaryPrecisionTransform
 from stamp.types import (
     GroundTruth,
@@ -74,6 +74,21 @@ def categorical_crossval_(
 
     if feature_type not in ("tile", "slide", "patient"):
         raise ValueError(f"Unknown feature type: {feature_type}")
+
+    # Apply MILAN-based sample weights if a MILAN table is provided
+    if config.milan_table is not None:
+        milan_weights = _load_milan_weights(config.milan_table, config.patient_label)
+        matched, unmatched = 0, 0
+        for pid in patient_to_data:
+            if pid in milan_weights:
+                patient_to_data[pid].sample_weight = milan_weights[pid]
+                matched += 1
+            else:
+                unmatched += 1
+        _logger.info(
+            f"MILAN weighting: {matched} patients matched, "
+            f"{unmatched} patients defaulting to weight 1.0"
+        )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     splits_file = config.output_dir / "splits.json"
@@ -251,10 +266,12 @@ def categorical_crossval_(
             # Infer feature dimension
             batch = next(iter(train_dl))
             if feature_type == "tile":
-                bags, _, _, _ = batch
+                # Batch format: (bags, coords, bag_sizes, targets, sample_weights)
+                bags = batch[0]
                 dim_feats = bags.shape[-1]
             else:
-                feats, _ = batch
+                # Batch format: (feats, targets, sample_weights)
+                feats = batch[0]
                 dim_feats = feats.shape[-1]
 
             model = setup_model_from_dataloaders(
@@ -282,6 +299,7 @@ def categorical_crossval_(
                 max_epochs=advanced.max_epochs,
                 patience=advanced.patience,
                 accelerator=advanced.accelerator,
+                calibration_config=config.calibration,
             )
         else:
             if feature_type == "tile":

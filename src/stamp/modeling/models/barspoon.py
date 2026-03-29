@@ -261,35 +261,53 @@ class LitMilClassificationMixin(lightning.LightningModule):
 
     def step(
         self,
-        batch: tuple[Bags, CoordinatesBatch, BagSizes, dict[str, torch.Tensor]] | list,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, dict[str, torch.Tensor], torch.Tensor] | list,
         step_name=None,
-    ):
-        """Process a batch with structure (feats, coords, bag_sizes, targets).
+    ) -> torch.Tensor:
+        """Process a batch with structure (feats, coords, bag_sizes, targets, sample_weights).
 
         Args:
-            batch: Tuple of (feats, coords, bag_sizes, targets) where:
+            batch: Tuple of (feats, coords, bag_sizes, targets, sample_weights) where:
                 - feats: bag features [batch, bag_size, feature_dim]
                 - coords: tile coordinates [batch, bag_size, 2]
                 - bag_sizes: number of tiles per bag [batch]
                 - targets: dict mapping target names to one-hot encoded tensors [batch, num_classes]
+                - sample_weights: per-sample weights [batch]
             step_name: Optional step name for logging ('train', 'validation', 'test').
         """
         feats: Bags
         coords: CoordinatesBatch
         bag_sizes: BagSizes
         targets: dict[str, torch.Tensor]
-        feats, coords, bag_sizes, targets = batch
+        sample_weights: torch.Tensor
+        feats, coords, bag_sizes, targets, sample_weights = batch
         logits = self(feats, coords)
 
         # Calculate the cross entropy loss for each target, then sum them
-        loss = sum(
-            F.cross_entropy(
-                (logit := logits[target_label]),
-                targets[target_label].type_as(logit),
-                weight=weight.type_as(logit),
+        # During training: apply sample weights to loss
+        # During validation/test: compute loss weight-agnostically (no sample weights)
+        if step_name == "train":
+            loss = torch.tensor(0.0, device=feats.device)
+            for target_label, weight in self.weights.items():
+                logit = logits[target_label]
+                # Per-sample loss
+                loss_per_sample = F.cross_entropy(
+                    logit,
+                    targets[target_label].type_as(logit),
+                    weight=weight.type_as(logit),
+                    reduction='none',
+                )
+                # Apply sample weights and sum across targets
+                loss = loss + (loss_per_sample * sample_weights.type_as(logit)).mean()
+        else:
+            loss = sum(
+                F.cross_entropy(
+                    (logit := logits[target_label]),
+                    targets[target_label].type_as(logit),
+                    weight=weight.type_as(logit),
+                )
+                for target_label, weight in self.weights.items()
             )
-            for target_label, weight in self.weights.items()
-        )
 
         if step_name:
             self.log(
@@ -334,7 +352,7 @@ class LitMilClassificationMixin(lightning.LightningModule):
         if len(batch) == 2:
             feats, positions = batch
         else:
-            feats, positions, _, _ = batch
+            feats, positions, _, _, _ = batch
 
         logits = self(feats, positions)
 

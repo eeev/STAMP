@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import lightning
+import pandas as pd
 import torch
 from lightning.pytorch.accelerators.accelerator import Accelerator
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -12,7 +13,8 @@ from lightning.pytorch.loggers import CSVLogger
 from sklearn.model_selection import train_test_split
 from torch.utils.data.dataloader import DataLoader
 
-from stamp.modeling.config import AdvancedConfig, TrainConfig
+from stamp.modeling.calibration import calibrate_model_
+from stamp.modeling.config import AdvancedConfig, TrainConfig, CalibrationConfig
 from stamp.modeling.data import (
     BagDataset,
     PatientData,
@@ -41,6 +43,44 @@ __license__ = "MIT"
 
 _logger = logging.getLogger("stamp")
 
+# Fixed mapping for experiments
+
+MILAN_CONFIDENCE: dict[str, float] = {
+    "I": 0.01,
+    "II": 0.05,
+    "III": 0.2,
+    "IVb": 0.5,
+    "IVa": 0.8,
+    "V": 0.95,
+    "VI": 1.0,
+}
+
+
+
+def _load_milan_weights(
+    milan_table: Path,
+    patient_label: str = "PATIENT",
+) -> dict[PatientId, float]:
+    """Load MILAN codes from a CSV and convert to per-patient confidence weights."""
+    df = pd.read_csv(milan_table, sep=";", dtype=str)
+    weights: dict[PatientId, float] = {}
+    unmapped = set()
+    for _, row in df.iterrows():
+        pid = PatientId(str(row[patient_label]).strip())
+        milan_code = str(row["Milan-C"]).strip()
+        if milan_code in MILAN_CONFIDENCE:
+            weights[pid] = MILAN_CONFIDENCE[milan_code]
+        else:
+            unmapped.add(milan_code)
+            weights[pid] = 1.0
+    if unmapped:
+        _logger.warning(f"Unknown MILAN codes mapped to weight 1.0: {unmapped}")
+    _logger.info(
+        f"Loaded MILAN weights for {len(weights)} patients "
+        f"(weight range: {min(weights.values()):.1f}–{max(weights.values()):.1f})"
+    )
+    return weights
+
 
 def train_categorical_model_(
     *,
@@ -66,6 +106,21 @@ def train_categorical_model_(
         drop_patients_with_missing_ground_truth=True,
     )
     _logger.info(f"Detected feature type: {feature_type}")
+
+    # Apply MILAN-based sample weights if a MILAN table is provided
+    if config.milan_table is not None:
+        milan_weights = _load_milan_weights(config.milan_table, config.patient_label)
+        matched, unmatched = 0, 0
+        for pid in patient_to_data:
+            if pid in milan_weights:
+                patient_to_data[pid].sample_weight = milan_weights[pid]
+                matched += 1
+            else:
+                unmatched += 1
+        _logger.info(
+            f"MILAN weighting: {matched} patients matched, "
+            f"{unmatched} patients defaulting to weight 1.0"
+        )
 
     # Train the model (the rest of the logic is unchanged)
     model, train_dl, valid_dl = setup_model_for_training(
@@ -94,6 +149,7 @@ def train_categorical_model_(
         max_epochs=advanced.max_epochs,
         patience=advanced.patience,
         accelerator=advanced.accelerator,
+        calibration_config=config.calibration,
     )
 
 
@@ -477,10 +533,10 @@ def setup_dataloaders_for_training(
         # Infer feature dimension automatically
         batch = next(iter(train_dl))
         if feature_type == "tile":
-            bags, _, _, _ = batch
+            bags, *_ = batch
             dim_feats = bags.shape[-1]
         else:
-            feats, _ = batch
+            feats, *_ = batch
             dim_feats = feats.shape[-1]
 
         return (
@@ -508,20 +564,33 @@ def train_model_(
     max_epochs: int,
     patience: int,
     accelerator: str | Accelerator,
+    calibration_config: "CalibrationConfig | None" = None,
 ) -> lightning.LightningModule:
     """Trains a model.
+
+    Args:
+        output_dir: Directory to save model checkpoints.
+        model: The Lightning model to train.
+        train_dl: Training dataloader.
+        valid_dl: Validation dataloader.
+        max_epochs: Maximum number of training epochs.
+        patience: Early stopping patience.
+        accelerator: Accelerator type (e.g., "gpu", "cpu").
+        calibration_config: Optional calibration configuration for temperature scaling.
 
     Returns:
         The model with the best validation loss during training.
     """
+    from stamp.modeling.config import CalibrationConfig
+
     torch.set_float32_matmul_precision("high")
 
     # Decide monitor metric based on task
     task = getattr(model.hparams, "task", None)
     if task == "survival":
         monitor_metric, mode = "val_cindex", "max"
-    else:  # regression or classification
-        monitor_metric, mode = "validation_loss", "min"
+    else:  # regression or classification; notice: switch mode between "validation_auroc" & "max" to "validation_loss" & "min"
+        monitor_metric, mode = "validation_auroc", "max"
 
     model_checkpoint = ModelCheckpoint(
         monitor=monitor_metric,
@@ -557,7 +626,22 @@ def train_model_(
 
     # Reload the best model using the same class as the input model
     ModelClass = type(model)
-    return ModelClass.load_from_checkpoint(model_checkpoint.best_model_path)
+    best_model = ModelClass.load_from_checkpoint(model_checkpoint.best_model_path)
+
+    # Apply temperature scaling calibration if configured
+    if calibration_config is None:
+        calibration_config = CalibrationConfig()
+
+    if calibration_config.enabled and task == "classification":
+        _logger.info("Applying temperature scaling calibration...")
+        calibrate_model_(
+            model=best_model,
+            valid_dl=valid_dl,
+            output_dir=output_dir,
+            config=calibration_config,
+        )
+
+    return best_model
 
 
 def _compute_class_weights_and_check_categories(
