@@ -20,7 +20,7 @@
 
 ### Motivation
 
-Modern deep neural networks, while achieving high discriminative performance, are frequently poorly calibrated — their predicted class probabilities do not accurately reflect the true likelihood of correctness. In clinical decision support, well-calibrated confidence scores are essential for trustworthy predictions. Temperature scaling, introduced by Guo et al. (2017), is a simple yet effective post-hoc calibration method that learns a single scalar parameter to rescale logits before the softmax function, improving calibration without affecting classification accuracy.
+Modern deep neural networks, while achieving high discriminative performance, are frequently poorly calibrated — their predicted class probabilities do not accurately reflect the true likelihood of correctness. In clinical decision support, well-calibrated confidence scores are essential for trustworthy predictions. Temperature scaling, as evaluated by Guo et al. (2017), is a simple yet effective post-hoc calibration method that learns a single scalar parameter to rescale logits before the softmax function, improving calibration without affecting classification accuracy.
 
 ### Method
 
